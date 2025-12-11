@@ -2256,19 +2256,24 @@ defmodule Phoenix.LiveViewTest do
 
   defp do_sequential_upload(upload, allowed_entries, percents, initial_errors) do
     result =
-      Enum.reduce_while(allowed_entries, {:ok, nil}, fn name, {:ok, _last_html} ->
+      Enum.reduce_while(allowed_entries, {:ok, nil, true}, fn name, {:ok, _last_html, first?} ->
+        # Sync between entries (not before the first)
+        unless first? do
+          sync_with_root!(upload.view)
+        end
+
         percent = percents[name]
 
         case render_chunk(upload, name, percent) do
           {:error, {:live_redirect, _opts}} = error -> {:halt, error}
           {:error, {:redirect, _opts}} = error -> {:halt, error}
           {:error, _reason} = error -> {:halt, error}
-          html -> {:cont, {:ok, html}}
+          html -> {:cont, {:ok, html, false}}
         end
       end)
 
     case result do
-      {:ok, html} ->
+      {:ok, html, _first?} ->
         # If we had initial errors but also successfully uploaded some entries
         if initial_errors != [] do
           {:error, aggregate_errors(initial_errors)}
