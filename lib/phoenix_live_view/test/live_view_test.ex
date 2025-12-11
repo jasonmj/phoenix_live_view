@@ -2292,8 +2292,8 @@ defmodule Phoenix.LiveViewTest do
       if step_percent do
         step_percent
       else
-        # Try to derive from config chunk_size
-        # For now, use a reasonable default
+        # Use a reasonable default of 5%
+        # Future enhancement: derive from config.chunk_size and entry sizes
         5
       end
 
