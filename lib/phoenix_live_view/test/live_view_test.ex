@@ -2338,8 +2338,9 @@ defmodule Phoenix.LiveViewTest do
         try do
           case UploadClient.chunk(upload, current_name, chunk_amount, proxy_pid(upload.view)) do
             {:ok, _} ->
+              # Sync and render after each chunk. If a redirect occurred, sync or render will throw exit.
               sync_with_root!(upload.view)
-              html = render(upload.view)
+              _html = render(upload.view)
 
               # Update progress
               new_progress = Map.put(progress, current_name, next_progress)

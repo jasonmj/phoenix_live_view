@@ -67,7 +67,49 @@ defmodule Phoenix.LiveView.RenderUploadsTest do
     end
   end
 
+  def consume(%Phoenix.LiveView.UploadEntry{} = entry, socket) do
+    socket =
+      cond do
+        entry.client_name == "redirect.jpeg" ->
+          Phoenix.LiveView.push_navigate(socket, to: "/redirected")
+
+        entry.client_name == "consume-and-redirect.jpeg" and entry.done? ->
+          _ =
+            Phoenix.LiveView.consume_uploaded_entry(socket, entry, fn _ ->
+              {:ok, entry.client_name}
+            end)
+
+          Phoenix.LiveView.push_navigate(socket, to: "/redirected")
+
+        entry.done? ->
+          name =
+            Phoenix.LiveView.consume_uploaded_entry(socket, entry, fn _ ->
+              {:ok, entry.client_name}
+            end)
+
+          Phoenix.Component.update(socket, :consumed, fn consumed -> [name] ++ consumed end)
+
+        true ->
+          socket
+      end
+
+    {:noreply, socket}
+  end
+
+  defp opts_for_allow_upload(opts) do
+    case Keyword.fetch(opts, :progress) do
+      {:ok, progress} ->
+        Keyword.put(opts, :progress, fn _, entry, socket ->
+          apply(__MODULE__, progress, [entry, socket])
+        end)
+
+      :error ->
+        opts
+    end
+  end
+
   setup %{allow: opts} do
+    opts = opts_for_allow_upload(opts)
     {:ok, lv} = mount_lv(fn socket -> Phoenix.LiveView.allow_upload(socket, :avatar, opts) end)
     {:ok, lv: lv}
   end
