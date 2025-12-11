@@ -2032,6 +2032,355 @@ defmodule Phoenix.LiveViewTest do
   end
 
   @doc """
+  Performs an upload of multiple file entries and renders the result.
+
+  This function allows uploading multiple files from a single file input,
+  simulating multi-entry upload behavior as would happen in the browser.
+  It supports both sequential and interleaved upload modes.
+
+  See `file_input/4` for details on building a file input with multiple entries.
+
+  ## Arguments
+
+    * `upload` - A `%Phoenix.LiveViewTest.Upload{}` struct built via `file_input/4`
+    * `entries_or_names` - Either `:all` to target all entries, or a list of entry names (strings)
+    * `percent` - Either an integer (0-100) applied to all entries, or a map of `%{name => percent}`
+      for per-entry control
+    * `opts` - Optional keyword list:
+      * `:mode` - Either `:sequential` (default) or `:interleaved`
+        * `:sequential` - Upload each entry to its target percent in order
+        * `:interleaved` - Round-robin chunking across entries to approximate concurrent browser behavior
+      * `:step_percent` - For `:interleaved` mode, the percentage to upload per iteration.
+        If not provided, derives from config chunk_size when possible, otherwise uses 5%
+
+  ## Examples
+
+  Upload all entries to 100%:
+
+      avatar = file_input(lv, "#my-form-id", :avatar, [
+        %{name: "file1.jpeg", content: File.read!("file1.jpg"), size: 1024},
+        %{name: "file2.jpeg", content: File.read!("file2.jpg"), size: 2048}
+      ])
+
+      assert render_uploads(avatar) =~ "file1.jpeg:100%"
+
+  Upload specific entries with per-entry percentages:
+
+      assert render_uploads(avatar, ["file1.jpeg", "file2.jpeg"], %{
+        "file1.jpeg" => 50,
+        "file2.jpeg" => 100
+      })
+
+  Upload in interleaved mode to simulate concurrent uploads:
+
+      assert render_uploads(avatar, :all, 100, mode: :interleaved)
+
+  ## Return values
+
+    * On success, returns the final rendered HTML string
+    * If any entries have errors (preflight errors, :not_allowed, etc.), returns `{:error, errors}`
+      where errors is a list aggregating all per-entry errors
+    * If a redirect occurs during upload, returns `{:error, {:live_redirect, opts}}` or
+      `{:error, {:redirect, opts}}`, which can be followed with `follow_redirect/2`
+    * Patches are handled in-band and the upload continues
+
+  ## Error aggregation
+
+  When multiple entries have errors, they are aggregated into a single error tuple.
+  Each entry's error maintains its original format (e.g., `[[entry_ref, reason]]` for
+  preflight errors, or `:not_allowed` for max_entries violations).
+
+  ## Notes
+
+  Use `:sequential` mode (the default) for most tests. Use `:interleaved` mode when
+  you need to test behavior specific to concurrent uploads, such as progress updates
+  across multiple files or interactions between simultaneous upload channels.
+  """
+  def render_uploads(upload, entries_or_names \\ :all, percent \\ 100, opts \\ [])
+
+  def render_uploads(%Upload{} = upload, entries_or_names, percent, opts) do
+    mode = Keyword.get(opts, :mode, :sequential)
+    step_percent = Keyword.get(opts, :step_percent)
+
+    # Build name to entry_ref map for validation
+    name_to_ref = build_name_to_ref_map(upload.entries)
+
+    # Resolve which entries to target
+    target_names = resolve_target_names(upload.entries, entries_or_names, name_to_ref)
+
+    # Resolve percent for each target entry
+    percents = resolve_percents(target_names, percent)
+
+    # Preflight and allow entries
+    case preflight_and_allow_entries(upload, target_names, name_to_ref) do
+      {:ok, allowed_entries, errors} ->
+        # If we have errors and no allowed entries, return errors immediately
+        if allowed_entries == [] and errors != [] do
+          {:error, aggregate_errors(errors)}
+        else
+          # Perform upload based on mode
+          case mode do
+            :sequential ->
+              do_sequential_upload(upload, allowed_entries, percents, errors)
+
+            :interleaved ->
+              do_interleaved_upload(upload, allowed_entries, percents, step_percent, errors)
+
+            _ ->
+              raise ArgumentError, "invalid mode #{inspect(mode)}, expected :sequential or :interleaved"
+          end
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp build_name_to_ref_map(entries) do
+    Enum.into(entries, %{}, fn %{"name" => name, "ref" => ref} -> {name, ref} end)
+  end
+
+  defp resolve_target_names(entries, :all, _name_to_ref) do
+    Enum.map(entries, fn %{"name" => name} -> name end)
+  end
+
+  defp resolve_target_names(_entries, names, name_to_ref) when is_list(names) do
+    # Validate all names exist
+    Enum.each(names, fn name ->
+      unless Map.has_key?(name_to_ref, name) do
+        raise ArgumentError, "no file input with name #{inspect(name)}"
+      end
+    end)
+
+    names
+  end
+
+  defp resolve_target_names(_entries, invalid, _name_to_ref) do
+    raise ArgumentError,
+          "entries_or_names must be :all or a list of entry names, got: #{inspect(invalid)}"
+  end
+
+  defp resolve_percents(target_names, percent) when is_integer(percent) do
+    unless percent >= 0 and percent <= 100 do
+      raise ArgumentError, "percent must be between 0 and 100, got: #{inspect(percent)}"
+    end
+
+    Enum.into(target_names, %{}, fn name -> {name, percent} end)
+  end
+
+  defp resolve_percents(target_names, percent_map) when is_map(percent_map) do
+    # Validate all keys in percent_map are in target_names
+    Enum.each(percent_map, fn {name, pct} ->
+      unless name in target_names do
+        raise ArgumentError,
+              "percent map includes entry #{inspect(name)} which is not in targeted entries"
+      end
+
+      unless is_integer(pct) and pct >= 0 and pct <= 100 do
+        raise ArgumentError,
+              "percent for #{inspect(name)} must be between 0 and 100, got: #{inspect(pct)}"
+      end
+    end)
+
+    # Fill in 100% for any missing entries
+    Enum.into(target_names, %{}, fn name -> {name, Map.get(percent_map, name, 100)} end)
+  end
+
+  defp resolve_percents(_target_names, invalid) do
+    raise ArgumentError,
+          "percent must be an integer or a map of entry names to percentages, got: #{inspect(invalid)}"
+  end
+
+  defp preflight_and_allow_entries(upload, target_names, name_to_ref) do
+    # Check if any entry needs preflight
+    needs_preflight =
+      Enum.any?(target_names, fn name ->
+        case UploadClient.fetch_allow_acknowledged(upload, name) do
+          {:error, :nopreflight} -> true
+          _ -> false
+        end
+      end)
+
+    if needs_preflight do
+      # Do single preflight for all entries
+      case preflight_upload(upload) do
+        {:ok, %{ref: ref, config: config, entries: entries_resp, errors: preflight_errors}} ->
+          # Call allowed_ack for each target entry
+          {allowed, errors} =
+            Enum.reduce(target_names, {[], []}, fn name, {allowed_acc, errors_acc} ->
+              entry_ref = name_to_ref[name]
+
+              cond do
+                # Check for preflight errors
+                preflight_errors[entry_ref] ->
+                  error_list =
+                    for reason <- preflight_errors[entry_ref], do: [entry_ref, reason]
+
+                  UploadClient.allowed_ack(upload, ref, config, name, entries_resp, preflight_errors)
+                  {allowed_acc, [error_list | errors_acc]}
+
+                # Try to allow the entry
+                true ->
+                  case UploadClient.allowed_ack(
+                         upload,
+                         ref,
+                         config,
+                         name,
+                         entries_resp,
+                         preflight_errors
+                       ) do
+                    :ok -> {[name | allowed_acc], errors_acc}
+                    {:error, reason} -> {allowed_acc, [reason | errors_acc]}
+                  end
+              end
+            end)
+
+          {:ok, Enum.reverse(allowed), Enum.reverse(errors)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      # All entries already preflighted, just check allowed status
+      {allowed, errors} =
+        Enum.reduce(target_names, {[], []}, fn name, {allowed_acc, errors_acc} ->
+          case UploadClient.fetch_allow_acknowledged(upload, name) do
+            {:ok, _token} -> {[name | allowed_acc], errors_acc}
+            {:error, reason} -> {allowed_acc, [reason | errors_acc]}
+          end
+        end)
+
+      {:ok, Enum.reverse(allowed), Enum.reverse(errors)}
+    end
+  end
+
+  defp do_sequential_upload(upload, allowed_entries, percents, initial_errors) do
+    result =
+      Enum.reduce_while(allowed_entries, {:ok, nil}, fn name, {:ok, _last_html} ->
+        percent = percents[name]
+
+        case render_chunk(upload, name, percent) do
+          {:error, {:live_redirect, _opts}} = error -> {:halt, error}
+          {:error, {:redirect, _opts}} = error -> {:halt, error}
+          {:error, _reason} = error -> {:halt, error}
+          html -> {:cont, {:ok, html}}
+        end
+      end)
+
+    case result do
+      {:ok, html} ->
+        # If we had initial errors but also successfully uploaded some entries
+        if initial_errors != [] do
+          {:error, aggregate_errors(initial_errors)}
+        else
+          html
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp do_interleaved_upload(upload, allowed_entries, percents, step_percent, initial_errors) do
+    # Calculate step percent if not provided
+    step =
+      if step_percent do
+        step_percent
+      else
+        # Try to derive from config chunk_size
+        # For now, use a reasonable default
+        5
+      end
+
+    # Initialize progress tracking
+    progress = Enum.into(allowed_entries, %{}, fn name -> {name, 0} end)
+
+    # Perform round-robin chunking
+    result = do_interleaved_loop(upload, allowed_entries, percents, progress, step)
+
+    case result do
+      {:ok, html} ->
+        if initial_errors != [] do
+          {:error, aggregate_errors(initial_errors)}
+        else
+          html
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp do_interleaved_loop(upload, active_entries, target_percents, progress, step) do
+    if active_entries == [] do
+      # All entries complete
+      {:ok, render(upload.view)}
+    else
+      # Process next entry in round-robin
+      [current_name | rest] = active_entries
+      current_progress = progress[current_name]
+      target_percent = target_percents[current_name]
+
+      # Calculate how much to upload this iteration
+      next_progress = min(current_progress + step, target_percent)
+      chunk_amount = next_progress - current_progress
+
+      if chunk_amount > 0 do
+        pid = proxy_pid(upload.view)
+        monitor_ref = Process.monitor(pid)
+        trap = Process.flag(:trap_exit, true)
+
+        try do
+          case UploadClient.chunk(upload, current_name, chunk_amount, proxy_pid(upload.view)) do
+            {:ok, _} ->
+              sync_with_root!(upload.view)
+              html = render(upload.view)
+
+              # Update progress
+              new_progress = Map.put(progress, current_name, next_progress)
+
+              # Determine if this entry is complete
+              new_active_entries =
+                if next_progress >= target_percent do
+                  rest
+                else
+                  rest ++ [current_name]
+                end
+
+              Process.flag(:trap_exit, trap)
+              do_interleaved_loop(upload, new_active_entries, target_percents, new_progress, step)
+
+            {:error, reason} ->
+              Process.flag(:trap_exit, trap)
+              {:error, reason}
+          end
+        catch
+          :exit, reason ->
+            receive do
+              {:DOWN, ^monitor_ref, :process, _pid, {:shutdown, {:live_redirect, opts}}} ->
+                {:error, {:live_redirect, opts}}
+
+              {:DOWN, ^monitor_ref, :process, _pid, {:shutdown, {:redirect, opts}}} ->
+                {:error, {:redirect, opts}}
+            after
+              0 -> exit(reason)
+            end
+        after
+          Process.flag(:trap_exit, trap)
+        end
+      else
+        # No more to upload for this entry, remove it
+        do_interleaved_loop(upload, rest, target_percents, progress, step)
+      end
+    end
+  end
+
+  defp aggregate_errors(errors) do
+    # Flatten nested error lists
+    List.flatten(errors)
+  end
+
+  @doc """
   Performs a preflight upload request.
 
   Useful for testing external uploaders to retrieve the `:external` entry metadata.
