@@ -2051,7 +2051,7 @@ defmodule Phoenix.LiveViewTest do
         * `:sequential` - Upload each entry to its target percent in order
         * `:interleaved` - Round-robin chunking across entries to approximate concurrent browser behavior
       * `:step_percent` - For `:interleaved` mode, the percentage to upload per iteration.
-        If not provided, derives from config chunk_size when possible, otherwise uses 5%
+        Defaults to 5% if not provided
 
   ## Examples
 

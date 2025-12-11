@@ -1,4 +1,6 @@
 defmodule Phoenix.LiveView.RenderUploadsTest do
+  # async: false is required for upload tests due to LiveView channel setup
+  # and shared endpoint/supervisor state across tests
   use ExUnit.Case, async: false
   require Phoenix.ChannelTest
 
